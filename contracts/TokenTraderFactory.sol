@@ -21,6 +21,18 @@ pragma solidity ^0.4.4;
 //                     Added check in createTradeContract(...) to prevent
 //                     GNTs from being used with this contract. The asset
 //                     token will need to have an allowance(...) function.
+//   Mar 04 2017 - JL - Added internal function min()
+//                    - Buying and selling now takes the minimum of what can be bought 
+//                    and what can be sold when determining the order size 
+//                    instead of taking one then ajusting for the other
+//                    - Added overflow check
+//                    - TakerBoughtAsset and TakerSoldAsset only fire on non zero order size
+//                    - makerWithdrawEther withdraws total balance 
+//                      if owner attempts to withdraw more than they have
+//                    - factory verify function now also returns the wei/ether 
+//                      and asset balance of a trade contract
+//
+//
 //
 // Enjoy. (c) JonnyLatte & BokkyPooBah 2017. The MIT licence.
 // ------------------------------------------------------------------------
@@ -215,10 +227,9 @@ contract TokenTrader is Owned {
     // This method was called withdraw() in the old version
     //
     function makerWithdrawEther(uint256 ethers) onlyOwner returns (bool ok) {
-        if (this.balance >= ethers) {
-            MakerWithdrewEther(ethers);
-            return owner.send(ethers);
-        }
+        if (ethers > this.balance) ethers = this.balance;
+        MakerWithdrewEther(ethers);
+        return owner.send(ethers);
     }
 
     // Maker can transfer ethers from this contract to another TokenTrader
@@ -248,6 +259,14 @@ contract TokenTrader is Owned {
             toTokenTrader.makerDepositEther.value(ethers)();
         }
     }
+    
+    // internal function min
+    // returns the minimum of 2 given values
+    //
+    function min(uint A, uint B) internal returns (uint) {
+        if(A < B) return A;
+        return B;
+    }
 
     // Taker buys asset tokens by sending ethers
     //
@@ -263,21 +282,35 @@ contract TokenTrader is Owned {
     function takerBuyAsset() payable {
         if (sellsTokens || msg.sender == owner) {
             // Note that sellPrice has already been validated as > 0
-            uint order    = msg.value / sellPrice;
+            uint can_buy    = msg.value / sellPrice;
             // Note that units has already been validated as > 0
             uint can_sell = ERC20(asset).balanceOf(address(this)) / units;
-            uint256 change = 0;
-            if (msg.value > (can_sell * sellPrice)) {
-                change  = msg.value - (can_sell * sellPrice);
-                order = can_sell;
-            }
+            
+            // the order size is the smallest out of what can be bought and what can be sold
+            uint order = min(can_buy,can_sell);
+            
+            // the ether value of the trade is the order size times the price 
+            uint tradeEtherValue = order * sellPrice;
+            if(tradeEtherValue / sellPrice != order) throw; // overflow check
+            
+            // change is equal to what was sent minus the ether value of the trade
+            uint change  = msg.value - tradeEtherValue;
+
+            // if there is change return it
+            // funds not returned are the funds that the maker keeps
             if (change > 0) {
                 if (!msg.sender.send(change)) throw;
             }
+            
+            // if the order size is greater than zero send taker their tokens
             if (order > 0) {
-                if (!ERC20(asset).transfer(msg.sender, order * units)) throw;
+                // asset value is equal the order size times the amount of tokens in each unit lot
+                uint assetValueOfTrade = order * units;
+                if(assetValueOfTrade / units != order) throw; // overflow check
+                // send taker their tokens
+                if (!ERC20(asset).transfer(msg.sender,assetValueOfTrade)) throw;
+                TakerBoughtAsset(msg.sender, tradeEtherValue, change, assetValueOfTrade);
             }
-            TakerBoughtAsset(msg.sender, msg.value, change, order * units);
         }
         // Return user funds if the contract is not selling
         else if (!msg.sender.send(msg.value)) throw;
@@ -305,18 +338,27 @@ contract TokenTrader is Owned {
             // Maximum number of token the contract can buy
             // Note that buyPrice has already been validated as > 0
             uint256 can_buy = this.balance / buyPrice;
-            // Token lots available
+            // Maximum number of token the contract can sell
             // Note that units has already been validated as > 0
-            uint256 order = amountOfTokensToSell / units;
-            // Adjust order for funds available
-            if (order > can_buy) order = can_buy;
+            uint256 can_sell = amountOfTokensToSell / units;
+            // The order size is the minimum of what can be bought or sold
+            uint order = min(can_buy,can_sell);
+            
+            // if the order is not zero then go ahead with the trade
             if (order > 0) {
+                uint assetValueOfTrade = order * units;
+                if(assetValueOfTrade / units != order) throw; // overflow check
+                
+                uint etherValueOfTrade = order * buyPrice;
+                if(etherValueOfTrade / buyPrice != order) throw; // overflow check
+                
                 // Extract user tokens
-                if (!ERC20(asset).transferFrom(msg.sender, address(this), order * units)) throw;
+                if (!ERC20(asset).transferFrom(msg.sender, address(this), assetValueOfTrade)) throw;
                 // Pay user
-                if (!msg.sender.send(order * buyPrice)) throw;
+                if (!msg.sender.send(etherValueOfTrade)) throw;
+                
+                TakerSoldAsset(msg.sender, amountOfTokensToSell, assetValueOfTrade, etherValueOfTrade);
             }
-            TakerSoldAsset(msg.sender, amountOfTokensToSell, order * units, order * buyPrice);
         }
     }
 
@@ -349,6 +391,8 @@ contract TokenTraderFactory is Owned {
     //   units        is the number of units of asset tokens
     //   buysTokens   is the TokenTrader contract buying tokens?
     //   sellsTokens  is the TokenTrader contract selling tokens?
+    //   ethBalance   is the currenct ether balance of the trade contract
+    //   assetBalance is the currenct asset/token balance of the trade contract
     //
     function verify(address tradeContract) constant returns (
         bool    valid,
@@ -358,7 +402,9 @@ contract TokenTraderFactory is Owned {
         uint256 sellPrice,
         uint256 units,
         bool    buysTokens,
-        bool    sellsTokens
+        bool    sellsTokens,
+        uint256 weiBalance,
+        uint256 assetBalance
     ) {
         valid = _verify[tradeContract];
         if (valid) {
@@ -370,6 +416,8 @@ contract TokenTraderFactory is Owned {
             units         = t.units();
             buysTokens    = t.buysTokens();
             sellsTokens   = t.sellsTokens();
+            weiBalance    = tradeContract.balance;
+            assetBalance  = ERC20(asset).balanceOf(tradeContract);
         }
     }
 
